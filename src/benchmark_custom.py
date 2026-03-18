@@ -92,7 +92,23 @@ class _ModelAdapter:
     def predict(self, obs, state=None, episode_start=None, deterministic=True):
         obs_t = _obs_to_tensor(obs, self._device, obs_rms=self._obs_rms)
         with torch.no_grad():
-            if self._policy == "lstm":
+            if self._policy == "drqn":
+                obs_seq = obs_t.unsqueeze(1)
+
+                is_start = False
+                if episode_start is not None:
+                    is_start = episode_start if isinstance(episode_start, bool) else episode_start.all()
+
+                # reset memory if starting a new episode
+                if state is None or is_start:
+                    state = self._ac.get_initial_hidden_state(obs_seq.size(0), self._device)
+
+                # get Q-values and take the argmax
+                q_vals, new_state = self._ac(obs_seq, state)
+                action = q_vals.squeeze(1).argmax(dim=-1).cpu().numpy()[0]
+                return action, new_state
+
+            elif self._policy == "lstm":
                 ep_t = torch.tensor(episode_start, dtype=torch.float32, device=self._device)
                 action, _, _, new_state = self._ac.get_action_and_value(obs_t, state, ep_t)
                 return action.cpu().numpy()[0], new_state
@@ -108,7 +124,9 @@ def _load_model(path: str, policy: str, device: str,
     # Fixed dims: obs_dim=8 (5 llm + 3 macro), act_dim=7
     obs_dim, act_dim = 8, 7
     hidden = lstm_hidden_size or config.LSTM_HIDDEN_SIZE
-    if policy == "lstm":
+    if policy == "drqn":
+        ac = DuelingDRQN(obs_dim, act_dim, hidden_size=64).to(device)
+    elif policy == "lstm":
         ac = LSTMActorCritic(obs_dim, act_dim, lstm_hidden_size=hidden, n_lstm_layers=1).to(device)
     else:
         ac = ActorCritic(obs_dim, act_dim).to(device)
@@ -176,7 +194,7 @@ def evaluate_ppo(model, env_factory, n_seeds: int, policy: str = "mlp") -> list[
         lstm_states = None
         episode_start = np.ones((1,), dtype=bool)
         while not done:
-            if policy == "lstm":
+            if policy in ("lstm", "drqn"):
                 action, lstm_states = model.predict(
                     obs, state=lstm_states, episode_start=episode_start, deterministic=True
                 )
@@ -234,7 +252,7 @@ def _collect_trajectory_ppo(model, env_factory, seed: int = 0,
         pi_hist.append(float(pi))
         u_hist.append(float(u))
         rate_hist.append(float(rate))
-        if policy == "lstm":
+        if policy in ("lstm", "drqn"):
             action, lstm_states = model.predict(
                 obs, state=lstm_states, episode_start=episode_start, deterministic=True
             )
@@ -282,9 +300,9 @@ def _find_scenario_seeds() -> dict[str, int]:
 
 _CONDITION_STYLES = {
     "taylor_rule": {"color": "green",     "label": "Taylor Rule"},
-    "baseline":    {"color": "purple",    "label": "Baseline PPO"},
-    "oracle":      {"color": "steelblue", "label": "Oracle PPO"},
-    "llm":         {"color": "darkorange","label": "LLM PPO"},
+    "baseline":    {"color": "purple",    "label": "Baseline DRQN"},
+    "oracle":      {"color": "steelblue", "label": "Oracle DRQN"},
+    "llm":         {"color": "darkorange","label": "LLM DRQN"},
 }
 
 
@@ -664,7 +682,7 @@ def main():
     parser.add_argument("--seeds",         type=int, default=config.EVAL_SEEDS,
                         help=f"Number of evaluation seeds (default {config.EVAL_SEEDS})")
     parser.add_argument("--policy",        type=str, default="mlp",
-                        choices=["mlp", "lstm"],
+                        choices=["mlp", "lstm", "drqn"],
                         help="Policy architecture used during training (default: mlp)")
     parser.add_argument("--ema",           action="store_true",
                         help="Use best_model_ema.pt instead of best_model.pt during auto-discovery")
@@ -868,21 +886,20 @@ def main():
             run_meta=run_meta,
         )
 
-    # -- Update metadata.json ----------------------------------
-    if run_meta is not None and run_dir:
-        run_meta["benchmark"] = {
-            "seeds": args.seeds,
-            "evaluated_at": datetime.now().isoformat(timespec="seconds"),
-            "conditions": {
-                name: {
-                    "mean": round(float(np.mean(rewards)), 4),
-                    "std":  round(float(np.std(rewards)), 4),
-                }
-                for name, rewards in results.items()
-            },
-        }
-        _save_metadata(run_dir, run_meta)
-        print(f"Metadata updated -> {os.path.join(run_dir, 'metadata.json')}")
+
+    from gfc_env import GFCEnv, gfc_eval, plot_gfc_trajectories
+    print("\n>>> Running GFC Benchmark...")
+    gfc_results = {}
+
+    if oracle_model is not None:
+        gfc_results["oracle"] = gfc_eval(model=oracle_model, env_factory=lambda: MockLLMObservationWrapper(GFCEnv()), policy=args.policy)
+    if llm_model is not None:
+        gfc_results["llm"] = gfc_eval(model=llm_model, env_factory=lambda: StateKeyedLLMWrapper(GFCEnv(), db_path=args.db), policy=args.policy)
+    if base_model is not None:
+        gfc_results["baseline"] = gfc_eval(model=base_model, env_factory=lambda: GFCEnv(), policy=args.policy)
+
+    if gfc_results:
+        plot_gfc_trajectories(gfc_results, out_dir)
 
 
 if __name__ == "__main__":
