@@ -25,6 +25,7 @@ import config
 from fed_env import FedEnvBase, StateKeyedLLMWrapper, MockLLMObservationWrapper
 from covid_env import CovidEnv, covid_eval as _covid_eval
 from network import ActorCritic, LSTMActorCritic
+from drqn_network import DuelingDRQN
 
 
 # -------------------------------------------------------------
